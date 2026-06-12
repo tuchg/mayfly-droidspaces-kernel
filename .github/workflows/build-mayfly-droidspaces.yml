@@ -1,0 +1,205 @@
+name: Build mayfly Droidspaces kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Feature profile
+        default: baseline
+        required: true
+        type: choice
+        options:
+          - baseline
+          - droidspaces-min
+      lto_mode:
+        description: LTO mode. stock-full matches phone; thin is CI-friendlier.
+        default: thin
+        required: true
+        type: choice
+        options:
+          - thin
+          - stock-full
+      kernel_name:
+        description: Artifact prefix
+        default: mayfly-Lineage-Droidspaces
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex git libelf-dev \
+            libncurses5-dev libssl-dev lz4 python-is-python3 python3 \
+            rsync unzip wget zip zlib1g-dev
+
+      - name: Setup ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-mayfly-5.10-${{ inputs.profile }}-${{ inputs.lto_mode }}-${{ github.sha }}
+          restore-keys: |
+            ccache-mayfly-5.10-${{ inputs.profile }}-${{ inputs.lto_mode }}-
+            ccache-mayfly-5.10-
+
+      - name: Download Android clang r563880c
+        run: |
+          set -euo pipefail
+          git clone --depth=1 --filter=blob:none --sparse \
+            -b mirror-goog-llvm-r584948-release \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
+            android-clang
+          cd android-clang
+          git sparse-checkout set clang-r563880c
+          echo "$GITHUB_WORKSPACE/android-clang/clang-r563880c/bin" >> "$GITHUB_PATH"
+          "$GITHUB_WORKSPACE/android-clang/clang-r563880c/bin/clang" --version
+
+      - name: Clone LineageOS SM8450 kernel
+        run: |
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_kernel_xiaomi_sm8450.git \
+            -b lineage-23.2 \
+            kernel-src
+
+      - name: Apply config and profile
+        run: |
+          set -euo pipefail
+          cd kernel-src
+          mkdir -p out
+          cp "$GITHUB_WORKSPACE/configs/mayfly-lineage-23.2-20260605.config" out/.config
+
+          if [ "${{ inputs.profile }}" = "droidspaces-min" ]; then
+            patch -p1 < "$GITHUB_WORKSPACE/patches/GKI/5.10/GKI-5.10-sysvipc_kabi_6_7_8.patch"
+            patch -p1 < "$GITHUB_WORKSPACE/patches/GKI/5.10/GKI_5.10_posix.patch"
+            scripts/config --file out/.config \
+              --enable SYSVIPC \
+              --enable POSIX_MQUEUE \
+              --enable IPC_NS \
+              --enable PID_NS \
+              --enable DEVTMPFS
+          fi
+
+          if [ "${{ inputs.lto_mode }}" = "thin" ]; then
+            scripts/config --file out/.config \
+              --enable LTO \
+              --enable LTO_CLANG \
+              --disable LTO_CLANG_FULL \
+              --enable LTO_CLANG_THIN \
+              --disable LTO_NONE \
+              --enable CFI_CLANG \
+              --enable CFI_CLANG_SHADOW
+          fi
+
+      - name: Build kernel
+        run: |
+          set -euo pipefail
+          cd kernel-src
+          export ARCH=arm64
+          export LLVM=1
+          export LLVM_IAS=1
+          export PATH="$GITHUB_WORKSPACE/android-clang/clang-r563880c/bin:$PATH"
+          export CCACHE_DIR=~/.ccache
+          export KBUILD_BUILD_USER=github-actions
+          export KBUILD_BUILD_HOST=mayfly-lineage
+          clang --version | tee out/clang-version.txt
+          make O=out olddefconfig
+          make -j"$(nproc)" O=out Image.lz4 modules 2>&1 | tee out/build.log
+
+      - name: Sanity check
+        run: |
+          set -euo pipefail
+          cd kernel-src
+          failures=0
+          fail(){ echo "::error::$1"; failures=$((failures+1)); }
+          cfg=out/.config
+          grep -Eq '^VERSION = 5$' Makefile || fail 'Kernel VERSION != 5'
+          grep -Eq '^PATCHLEVEL = 10$' Makefile || fail 'Kernel PATCHLEVEL != 10'
+          grep -Eq '^SUBLEVEL = 252$' Makefile || fail 'Kernel SUBLEVEL != 252'
+          [ -f out/arch/arm64/boot/Image ] || fail 'Missing Image'
+          [ -f out/arch/arm64/boot/Image.lz4 ] || fail 'Missing Image.lz4'
+          grep -Fq 'Android (14054515' out/clang-version.txt || fail 'Compiler is not Android clang build 14054515'
+          grep -Eq '^CONFIG_LOCALVERSION="-gki"$' "$cfg" || fail 'CONFIG_LOCALVERSION mismatch'
+          grep -Eq '^CONFIG_CFI_CLANG=y$' "$cfg" || fail 'CFI missing'
+          grep -Eq '^CONFIG_CFI_CLANG_SHADOW=y$' "$cfg" || fail 'CFI shadow missing'
+
+          if [ "${{ inputs.profile }}" = "droidspaces-min" ]; then
+            for opt in CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_IPC_NS CONFIG_PID_NS CONFIG_DEVTMPFS; do
+              grep -Eq "^${opt}=y$" "$cfg" || fail "$opt missing"
+            done
+          fi
+          if [ "$failures" -ne 0 ]; then exit 1; fi
+
+      - name: Package diagnostic
+        run: |
+          set -euo pipefail
+          slug="${{ inputs.kernel_name }}-mayfly-${{ inputs.profile }}-${{ inputs.lto_mode }}"
+          outdir="$GITHUB_WORKSPACE/artifacts/${slug}-diagnostic"
+          mkdir -p "$outdir"
+          cp kernel-src/out/.config "$outdir/built.config"
+          cp configs/mayfly-lineage-23.2-20260605.config "$outdir/stock.config"
+          cp kernel-src/out/clang-version.txt "$outdir/"
+          cp kernel-src/out/build.log "$outdir/"
+          cp kernel-src/out/arch/arm64/boot/Image "$outdir/"
+          cp kernel-src/out/arch/arm64/boot/Image.lz4 "$outdir/"
+          if [ -f kernel-src/out/Module.symvers ]; then cp kernel-src/out/Module.symvers "$outdir/"; fi
+          if [ -f kernel-src/out/modules.order ]; then cp kernel-src/out/modules.order "$outdir/"; fi
+          find kernel-src/out -type f -name '*.ko' -printf '%P\n' | sort > "$outdir/built-modules.paths"
+          find "$outdir" -type f -printf '%P\t%s bytes\n' | sort > "$outdir/MANIFEST.txt"
+          cd "$GITHUB_WORKSPACE/artifacts"
+          zip -r9 "${slug}-diagnostic.zip" "${slug}-diagnostic"
+
+      - name: Package AnyKernel3 boot-only zip
+        run: |
+          set -euo pipefail
+          slug="${{ inputs.kernel_name }}-mayfly-${{ inputs.profile }}-${{ inputs.lto_mode }}"
+          zipout="$GITHUB_WORKSPACE/artifacts/${slug}-anykernel3.zip"
+          rm -rf anykernel
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git anykernel
+          rm -rf anykernel/.git anykernel/.github
+          cp kernel-src/out/arch/arm64/boot/Image anykernel/Image
+          cat > anykernel/anykernel.sh <<EOF
+          #!/sbin/sh
+          properties() { '
+          kernel.string=${slug} for LineageOS 23.2 mayfly
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=mayfly
+          device.name2=Xiaomi 12S
+          supported.versions=
+          supported.patchlevels=
+          '; }
+          block=boot;
+          is_slot_device=1;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+          . tools/ak3-core.sh;
+          dump_boot;
+          write_boot;
+          EOF
+          cd anykernel
+          zip -r9 "$zipout" . -x '*.git*' -x 'README.md' -x '*placeholder*'
+
+      - name: Upload diagnostic
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.kernel_name }}-mayfly-${{ inputs.profile }}-${{ inputs.lto_mode }}-diagnostic
+          path: artifacts/${{ inputs.kernel_name }}-mayfly-${{ inputs.profile }}-${{ inputs.lto_mode }}-diagnostic.zip
+          retention-days: 7
+
+      - name: Upload AnyKernel3 zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.kernel_name }}-mayfly-${{ inputs.profile }}-${{ inputs.lto_mode }}-anykernel3
+          path: artifacts/${{ inputs.kernel_name }}-mayfly-${{ inputs.profile }}-${{ inputs.lto_mode }}-anykernel3.zip
+          retention-days: 7
